@@ -2,7 +2,6 @@
 
 ```{r reproducability}
 set.seed(123)
-sessionInfo()
 ```
 
 ```{r libraries}
@@ -877,4 +876,5 @@ R2_table <- tibble(
 
 print(R2_table)
 ```
+
 
