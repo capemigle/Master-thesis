@@ -1,0 +1,877 @@
+# --- 1. Load required libraries ---
+
+```{r reproducability}
+set.seed(123)
+sessionInfo()
+```
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(fda)
+library(refund)
+library(zoo)
+```
+
+# --- 2. Helper commands ---
+
+```{r helper}
+yw_label <- function(date) {
+  paste0(isoyear(date), "-W", str_pad(isoweek(date), 2, pad = "0"))
+}
+
+to_mat <- function(df, value_col, id_col = "municipality_name") {
+  stopifnot(all(c(id_col, "year_week", "t", value_col) %in% names(df)))
+  
+  wide <- df %>%
+    dplyr::select(all_of(c(id_col, "year_week", "t", value_col))) %>%
+    distinct() %>%
+    arrange(.data$t) %>%
+    group_by(.data[[id_col]]) %>%
+    tidyr::complete(t = unique(.$t)) %>%
+    ungroup() %>%
+    arrange(.data[[id_col]], .data$t) %>%
+    mutate(year_week = NULL) %>%
+    pivot_wider(names_from = t, values_from = all_of(value_col), names_sort = TRUE)
+  
+  rn <- wide[[id_col]]
+  wide <- wide %>% dplyr::select(-all_of(id_col))
+  mat <- as.matrix(wide)
+  rownames(mat) <- rn
+  mat
+}
+```
+
+#  --- 3. Data upload ---
+
+```{r file_import}
+path_master    <- "data/master_weekly_fda_ready.csv"
+path_sentiment <- "data/media_weekly_sentiment.csv"
+
+master <- read_csv(file = path_master, locale = locale(encoding = "UTF-8"), show_col_types = FALSE) %>%
+  clean_names() %>%
+  mutate(
+    week_start = parse_date_time(week_start, orders = c("dmy", "Y-m-d", "mdy")),
+    year_week  = if_else(!is.na(year_week), year_week, yw_label(week_start))
+  ) %>%
+  dplyr::select(
+    municipality_name, week_start, year_week,
+    incidence, deaths_all,
+    total_1st_doses, total_2nd_doses, total_3rd_and_later_doses, vaccinations,
+    air_temp, rel_humidity, abs_humidity
+  )
+
+master <- master %>%
+  filter(!municipality_name %in% c("Nežinoma", "Nenustatyta"))
+```
+
+#  --- 4. Sentiment data ---
+
+```{r sentiment_data}
+sent_raw <- read_csv(
+  file = path_sentiment,
+  locale = locale(encoding = "UTF-8"),
+  show_col_types = FALSE,
+  na = c("", "NA", "NaN")
+) %>%
+  clean_names() %>%
+  mutate(
+    sentiment_delfi   = as.numeric(sentiment_delfi),
+    sentiment_lrt     = as.numeric(sentiment_lrt),
+    sentiment_lrytas  = as.numeric(sentiment_lrytas)
+  )
+
+sent_na_summary <- sent_raw %>%
+  summarise(across(starts_with("sentiment_"), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "na_count")
+print(sent_na_summary)
+
+sent_clean <- sent_raw %>%
+  arrange(year_week) %>%
+  mutate(across(starts_with("sentiment_"), ~ zoo::na.approx(., na.rm = FALSE))) %>%
+  mutate(across(starts_with("sentiment_"), ~ zoo::na.locf(., na.rm = FALSE))) %>%
+  mutate(across(starts_with("sentiment_"), ~ zoo::na.locf(., fromLast = TRUE))) %>%
+  mutate(across(starts_with("sentiment_"), ~ replace_na(., 0))) %>%
+  mutate(
+    sentiment_avg = rowMeans(
+      cbind(sentiment_delfi, sentiment_lrt, sentiment_lrytas),
+      na.rm = TRUE
+    )
+  ) %>%
+  dplyr::select(year_week, dplyr::starts_with("sentiment_"))
+```
+
+#  --- 5. Weekly allignment ---
+
+```{r weekly_index}
+week_index <- master %>%
+  distinct(year_week, week_start) %>%
+  arrange(week_start) %>%
+  mutate(t = row_number())
+
+master <- master %>% left_join(week_index, by = c("year_week", "week_start"))
+sent   <- sent_clean %>% left_join(week_index %>% dplyr::select(year_week, t), by = "year_week")
+common_weeks <- intersect(week_index$year_week, sent$year_week)
+master <- master %>% filter(year_week %in% common_weeks)
+sent   <- sent   %>% filter(year_week %in% common_weeks)
+
+week_index <- master %>%
+  distinct(year_week, week_start) %>%
+  arrange(week_start) %>%
+  mutate(t = row_number())
+
+master <- master %>% dplyr::select(-t) %>% left_join(week_index, by = c("year_week","week_start"))
+sent   <- sent   %>% dplyr::select(-t) %>% left_join(week_index %>% dplyr::select(year_week, t), by = "year_week")
+
+t_grid <- week_index$t
+```
+
+#  --- 6. Municipality matrixes ---
+
+```{r municipality_matrices}
+master <- master %>% mutate(municipality_name = str_squish(municipality_name))
+
+cases_mat   <- to_mat(master, "incidence")
+dose1_mat   <- to_mat(master, "total_1st_doses")
+dose2_mat   <- to_mat(master, "total_2nd_doses")
+booster_mat <- to_mat(master, "total_3rd_and_later_doses")
+vacc_mat    <- to_mat(master, "vaccinations")
+temp_mat <- to_mat(master, "air_temp")
+ah_mat   <- to_mat(master, "abs_humidity")
+```
+
+#  --- 7. Sentiment alignment ---
+
+```{r sentiment_aligment}
+sent_long <- sent %>%
+  arrange(t) %>%
+  dplyr::select(t, sentiment_delfi, sentiment_lrt, sentiment_lrytas, sentiment_avg)
+
+stopifnot(length(sent_long$t) == ncol(cases_mat))
+
+sent_vec_delfi  <- sent_long$sentiment_delfi
+sent_vec_lrt    <- sent_long$sentiment_lrt
+sent_vec_lrytas <- sent_long$sentiment_lrytas
+sent_vec_avg    <- sent_long$sentiment_avg
+```
+
+#  --- 8. FDA preparation ---
+
+```{r fda_preparation}
+range_t <- c(min(t_grid), max(t_grid))
+nbasis_bspline <- 25     # For cases, vaccination, sentiment
+nbasis_fourier <- 25     # For temperature and absolute humidity 
+bspline_basis  <- create.bspline.basis(range_t, nbasis_bspline)
+fourier_basis  <- create.fourier.basis(range_t, nbasis_fourier)
+```
+
+#  --- 8. GCV computation ---
+
+```{r gcv}
+gcv_for_matrix <- function(t, mat, basis, lambdas, label) {
+  out <- map_dfr(lambdas, function(L) {
+    fit <- smooth.basis(t, t(mat), fdPar(basis, Lfdobj = 2, lambda = L))
+    tibble(lambda = L,
+           mean_gcv = mean(fit$gcv, na.rm = TRUE),
+           mean_df  = mean(fit$df,  na.rm = TRUE))
+  })
+  best <- out$lambda[which.min(out$mean_gcv)]
+  message("Optimal λ for ", label, " = ", signif(best, 4))
+  list(label = label, results = out, best_lambda = best)
+}
+
+gcv_for_vector <- function(t, y, basis, lambdas, label) {
+  ok <- is.finite(y)
+  out <- map_dfr(lambdas, function(L) {
+    fit <- smooth.basis(t[ok], y[ok], fdPar(basis, Lfdobj = 2, lambda = L))
+    tibble(lambda = L,
+           mean_gcv = mean(fit$gcv, na.rm = TRUE),
+           mean_df  = mean(fit$df,  na.rm = TRUE))
+  })
+  best <- out$lambda[which.min(out$mean_gcv)]
+  message("Optimal λ for ", label, " = ", signif(best, 4))
+  list(label = label, results = out, best_lambda = best)
+}
+
+lambda_grid_bspline <- 10^seq(-6, 4, length.out = 25)
+lambda_grid_fourier <- 10^seq(-6, 0, length.out = 15)
+
+
+res_cases   <- gcv_for_matrix(t_grid, cases_mat,   bspline_basis, lambda_grid_bspline, "Cases")
+res_vacc_total <- gcv_for_matrix(t_grid, vacc_mat,    bspline_basis, lambda_grid_bspline, "Vaccinations (Total)")
+res_dose1      <- gcv_for_matrix(t_grid, dose1_mat,   bspline_basis, lambda_grid_bspline, "Vaccinations (1st Dose)")
+res_dose2      <- gcv_for_matrix(t_grid, dose2_mat,   bspline_basis, lambda_grid_bspline, "Vaccinations (2nd Dose)")
+res_booster    <- gcv_for_matrix(t_grid, booster_mat, bspline_basis, lambda_grid_bspline, "Vaccinations (Booster)")
+res_temp <- gcv_for_matrix(t_grid, temp_mat, fourier_basis, lambda_grid_fourier, "Air Temperature")
+res_ah   <- gcv_for_matrix(t_grid, ah_mat,   fourier_basis, lambda_grid_fourier, "Absolute Humidity")
+res_sent_delfi  <- gcv_for_vector(t_grid, sent_vec_delfi,  bspline_basis, lambda_grid_bspline, "Sentiment – Delfi")
+res_sent_lrt    <- gcv_for_vector(t_grid, sent_vec_lrt,    bspline_basis, lambda_grid_bspline, "Sentiment – LRT")
+res_sent_lrytas <- gcv_for_vector(t_grid, sent_vec_lrytas, bspline_basis, lambda_grid_bspline, "Sentiment – Lrytas")
+res_sent_avg <- gcv_for_vector(t_grid, sent_vec_avg,bspline_basis, lambda_grid_bspline, "Sentiment – Average")
+```
+#  --- 9. Optimal lambda storing ---
+
+```{r lambda_storing}
+lambda_cases    <- res_cases$best_lambda
+lambda_vacc_total <- res_vacc_total$best_lambda
+lambda_dose1      <- res_dose1$best_lambda
+lambda_dose2      <- res_dose2$best_lambda
+lambda_booster    <- res_booster$best_lambda
+lambda_temp <- res_temp$best_lambda
+lambda_ah   <- res_ah$best_lambda
+lambda_sent_delfi  <- res_sent_delfi$best_lambda
+lambda_sent_lrt    <- res_sent_lrt$best_lambda
+lambda_sent_lrytas <- res_sent_lrytas$best_lambda
+lambda_sent_average <- res_sent_avg$best_lambda
+
+lambda_summary <- tibble(
+  Variable = c("Cases", "Vaccinations (Total)", "Vaccinations (1st Dose)", 
+               "Vaccinations (2nd Dose)", "Vaccinations (Booster)",
+               "Air Temperature", "Absolute Humidity",
+               "Sentiment – Delfi", "Sentiment – LRT", "Sentiment – Lrytas",
+               "Sentiment – Average"),
+  Lambda = c(lambda_cases,lambda_vacc_total, lambda_dose1, lambda_dose2, 
+             lambda_booster,lambda_temp, lambda_ah, lambda_sent_delfi,
+             lambda_sent_lrt, lambda_sent_lrytas, lambda_sent_average)
+)
+print(lambda_summary)
+```
+#  --- 10. Plotting before smoothing ---
+
+```{r eda_all_variables}
+national_df <- master %>%
+  group_by(t) %>%
+  summarise(
+    incidence     = mean(incidence, na.rm = TRUE),
+    vaccinations  = mean(vaccinations, na.rm = TRUE),
+    temp          = mean(air_temp, na.rm = TRUE),
+    abs_humidity  = mean(abs_humidity, na.rm = TRUE),
+    sentiment_avg = sent_long$sentiment_avg[t]
+  ) %>%
+  ungroup()
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+plot(national_df$t, national_df$incidence, type = "l",
+     col = "#D55E00", lwd = 2,
+     main = "National Weekly COVID-19 Cases",
+     xlab = "Week index (t)", ylab = "Cases")
+
+plot(national_df$t, national_df$vaccinations, type = "l",
+     col = "#0072B2", lwd = 2,
+     main = "National Weekly Vaccinations",
+     xlab = "Week index (t)", ylab = "Doses administered")
+
+plot(national_df$t, national_df$temp, type = "l",
+     col = "#E69F00", lwd = 2,
+     ylim = range(national_df$temp, na.rm = TRUE),
+     main = "Temperature and Absolute Humidity",
+     xlab = "Week index (t)",
+     ylab = "Temperature (°C)")
+
+par(new = TRUE)
+
+plot(national_df$t, national_df$abs_humidity, type = "l",
+     col = "#009E73", lwd = 2, lty = 2,
+     axes = FALSE, xlab = "", ylab = "",
+     ylim = range(national_df$abs_humidity, na.rm = TRUE))
+
+axis(side = 4)
+mtext("Absolute Humidity (g/m³)", side = 4, line = 3)
+
+legend("topright",
+       legend = c("Temperature (°C)", "Absolute Humidity (g/m³)"),
+       col = c("#E69F00", "#009E73"),
+       lty = c(1, 2),
+       lwd = 2,
+       bty = "n")
+
+plot(national_df$t, national_df$sentiment_avg, type = "l",
+     col = "#56B4E9", lwd = 2,
+     main = "National Weekly Avg Sentiment",
+     xlab = "Week index (t)", ylab = "Sentiment (−1 to +1)")
+abline(h = 0, lty = 2, col = "gray50")
+```
+#  --- 11. Smoothing variables ---
+
+```{r smoothing}
+fdPar_cases     <- fdPar(bspline_basis,  Lfdobj = 2, lambda = lambda_cases)
+fdPar_vacc_total<- fdPar(bspline_basis,  Lfdobj = 2, lambda = lambda_vacc_total)
+fdPar_dose1     <- fdPar(bspline_basis,  Lfdobj = 2, lambda = lambda_dose1)
+fdPar_dose2     <- fdPar(bspline_basis,  Lfdobj = 2, lambda = lambda_dose2)
+fdPar_booster   <- fdPar(bspline_basis,  Lfdobj = 2, lambda = lambda_booster)
+fdPar_temp      <- fdPar(fourier_basis,  Lfdobj = 2, lambda = lambda_temp)
+fdPar_ah        <- fdPar(fourier_basis,  Lfdobj = 2, lambda = lambda_ah)
+fdPar_sent      <- fdPar(bspline_basis,  Lfdobj = 2, lambda = lambda_sent_average)
+
+# Smooth municipality-level data
+cases_fd    <- smooth.basis(t_grid, t(cases_mat),    fdPar_cases)$fd
+
+vacc_fd     <- smooth.basis(t_grid, t(vacc_mat),     fdPar_vacc_total)$fd
+dose1_fd    <- smooth.basis(t_grid, t(dose1_mat),    fdPar_dose1)$fd
+dose2_fd    <- smooth.basis(t_grid, t(dose2_mat),    fdPar_dose2)$fd
+booster_fd  <- smooth.basis(t_grid, t(booster_mat),  fdPar_booster)$fd
+
+temp_fd     <- smooth.basis(t_grid, t(temp_mat),     fdPar_temp)$fd
+ah_fd       <- smooth.basis(t_grid, t(ah_mat),       fdPar_ah)$fd
+
+# Sentiment (single curves; smoothing)
+smooth_sent_fd <- function(t, y, fdPar, label) {
+  ok <- is.finite(y)
+  if (sum(ok) < 10) stop(paste("Too few valid observations for", label))
+  smooth.basis(t[ok], y[ok], fdPar)$fd
+}
+sent_fd_delfi  <- smooth_sent_fd(t_grid, sent_vec_delfi,  fdPar_sent, "Delfi")
+sent_fd_lrt    <- smooth_sent_fd(t_grid, sent_vec_lrt,    fdPar_sent, "LRT")
+sent_fd_lrytas <- smooth_sent_fd(t_grid, sent_vec_lrytas, fdPar_sent, "Lrytas")
+sent_fd_avg    <- smooth_sent_fd(t_grid, sent_vec_avg,    fdPar_sent, "Average")
+```
+
+#  --- 12. Plotting smooth curves (municipality) ---
+
+```{r fda_plots_municipality}
+plot_fda_variable <- function(t, mat, fd_obj, var_name, lambda, n_curves = nrow(mat)) {
+  par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
+  cols <- grDevices::rainbow(min(n_curves, 60))
+  
+  matplot(t, t(mat[1:n_curves, ]), type = "l", lty = 1, col = cols,
+          main = paste("Initial", var_name, "curves by municipality"),
+          xlab = "Week index (t)", ylab = var_name)
+  
+  plot(fd_obj[1:n_curves],
+       main = paste("Smoothed", var_name, "(λ =", signif(lambda, 3), ")"),
+       xlab = "Week index (t)", ylab = var_name,
+       col = cols, lwd = 2)
+}
+
+plot_fda_variable(t_grid, cases_mat, cases_fd, "COVID-19 Cases", lambda_cases)
+plot_fda_variable(t_grid, vacc_mat, vacc_fd, "Vaccinations (Total)", lambda_vacc_total)
+plot_fda_variable(t_grid, temp_mat, temp_fd, "Air Temperature", lambda_temp)
+plot_fda_variable(t_grid, ah_mat, ah_fd, "Absolute Humidity", lambda_ah)
+```
+#  --- 13. Plotting smooth curves (sentiment) ---
+
+```{r fda_sentiment_combined}
+plot_sentiment_all <- function(t, raw_df, fd_list, lambdas) {
+  par(mfrow = c(2, 1), mar = c(4, 4, 3, 1))
+  cols <- c("#E64B35FF", "#4DBBD5FF", "#00A087FF")
+  
+  matplot(
+    t,
+    raw_df[, c("sentiment_delfi", "sentiment_lrt", "sentiment_lrytas")],
+    type = "l", lty = 1, lwd = 1.5, col = cols,
+    main = "Initial Media Sentiment Curves (All Outlets)",
+    xlab = "Week index (t)", ylab = "Sentiment score (−1 to +1)"
+  )
+  abline(h = 0, lty = 2, col = "grey50")
+  legend("topright",
+         legend = c("Delfi", "LRT", "Lrytas"),
+         col = cols, lwd = 2, lty = 1, bty = "n")
+
+  eval_grid <- seq(min(t), max(t), length.out = 200)
+  sent_eval_delfi  <- eval.fd(eval_grid, fd_list$Delfi)
+  sent_eval_lrt    <- eval.fd(eval_grid, fd_list$LRT)
+  sent_eval_lrytas <- eval.fd(eval_grid, fd_list$Lrytas)
+  
+  plot(eval_grid, sent_eval_delfi, type = "l", lwd = 2, col = cols[1],
+       ylim = range(c(sent_eval_delfi, sent_eval_lrt, sent_eval_lrytas)),
+       xlab = "Week index (t)", ylab = "Sentiment score (−1 to +1)",
+       main = paste0("Smoothed Media Sentiment Curves (λ ≈ ",
+                     paste(signif(unlist(lambdas), 3), collapse = ", "), ")"))
+  lines(eval_grid, sent_eval_lrt,    lwd = 2, col = cols[2])
+  lines(eval_grid, sent_eval_lrytas, lwd = 2, col = cols[3])
+  abline(h = 0, lty = 2, col = "grey50")
+  legend("topright",
+         legend = c("Delfi", "LRT", "Lrytas"),
+         col = cols, lwd = 2, lty = 1, bty = "n")
+}
+
+sent_fd_list <- list(Delfi = sent_fd_delfi,
+                     LRT = sent_fd_lrt,
+                     Lrytas = sent_fd_lrytas)
+
+lambda_list <- list(lambda_sent_delfi, lambda_sent_lrt, lambda_sent_lrytas)
+
+plot_sentiment_all(t_grid, sent_long,
+                   fd_list = sent_fd_list,
+                   lambdas = lambda_list)
+```
+#  --- 14. FPCA ---
+
+```{r fpca}
+fpca_cases <- pca.fd(cases_fd, nharm = 4, centerfns = TRUE)
+fpca_vacc  <- pca.fd(vacc_fd,  nharm = 4, centerfns = TRUE)
+fpca_temp  <- pca.fd(temp_fd,  nharm = 4, centerfns = TRUE)
+fpca_ah    <- pca.fd(ah_fd,    nharm = 4, centerfns = TRUE)
+
+fpca_var_df <- tibble(
+  Variable  = rep(c("COVID-19 Cases", "Vaccinations (Total)", "Air Temperature", "Absolute Humidity"), each = 4),
+  Component = paste0("PC", rep(1:4, times = 4)),
+  Variance  = round(100 * c(fpca_cases$varprop[1:4],
+                            fpca_vacc$varprop[1:4],
+                            fpca_temp$varprop[1:4],
+                            fpca_ah$varprop[1:4]), 2)
+)
+
+ggplot(fpca_var_df, aes(Variance, Component, fill = Component)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(Variance, "%")), hjust = -0.1, size = 3) +
+  facet_wrap(~ Variable, ncol = 2, scales = "free_x") +
+  coord_cartesian(xlim = c(0, max(fpca_var_df$Variance) + 5)) +
+  scale_fill_brewer(palette = "Dark2") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold"),
+        plot.title = element_text(face = "bold", hjust = 0.5)) +
+  labs(title = "FPCA Scree Plots: Variance Explained",
+       x = "Variance explained (%)", y = "Principal component")
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+cols <- c("#D55E00", "#0072B2", "#009E73")
+
+plot(fpca_cases$harmonics[1:3], col = cols, lwd = 2,
+     main = "Cases: First Three FPCA Eigenfunctions",
+     xlab = "Week index (t)", ylab = "Eigenfunction value")
+legend("topright", c("PC1", "PC2", "PC3"), col = cols, lwd = 2, bty = "n")
+
+plot(fpca_vacc$harmonics[1:3], col = cols, lwd = 2,
+     main = "Vaccinations: First Three FPCA Eigenfunctions",
+     xlab = "Week index (t)", ylab = "Eigenfunction value")
+legend("topright", c("PC1", "PC2", "PC3"), col = cols, lwd = 2, bty = "n")
+
+plot(fpca_temp$harmonics[1:3], col = cols, lwd = 2,
+     main = "Temperature: First Three FPCA Eigenfunctions",
+     xlab = "Week index (t)", ylab = "Eigenfunction value")
+legend("topright", c("PC1", "PC2", "PC3"), col = cols, lwd = 2, bty = "n")
+
+plot(fpca_ah$harmonics[1:3], col = cols, lwd = 2,
+     main = "Absolute Humidity: First Three FPCA Eigenfunctions",
+     xlab = "Week index (t)", ylab = "Eigenfunction value")
+legend("topright", c("PC1", "PC2", "PC3"), col = cols, lwd = 2, bty = "n")
+```
+#  --- 15. FCCA ---
+
+```{r fcca}
+S_cases <- as.matrix(fpca_cases$scores[, 1:3])
+S_vacc  <- as.matrix(fpca_vacc$scores[, 1:2])
+S_temp <- as.matrix(fpca_temp$scores[, 1:3])
+S_ah   <- as.matrix(fpca_ah$scores[, 1:3])
+
+cc <- cancor(scale(S_cases), scale(S_vacc))
+
+rfcca_cases_vacc <- list(
+  rho = cc$cor,
+  uv  = tibble(
+    municipality = rownames(cases_mat),
+    U1 = as.numeric(scale(S_cases) %*% cc$xcoef[, 1]),
+    V1 = as.numeric(scale(S_vacc)  %*% cc$ycoef[, 1])
+  )
+)
+
+df_uv <- rfcca_cases_vacc$uv
+
+ggplot(df_uv, aes(x = U1, y = V1)) +
+  geom_point(color = "#1B9E77", alpha = 0.8, size = 2.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "grey40") +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = sprintf(
+      "Reduced FCCA: Cases vs Vaccinations (ρ[1] = %.2f)",
+      rfcca_cases_vacc$rho[1]
+    ),
+    x = expression("Cases Canonical Variate (" * U[1] * ")"),
+    y = expression("Vaccination Canonical Variate (" * V[1] * ")")
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+
+inc_nat <- colSums(cases_mat, na.rm = TRUE)
+
+lag_corr <- function(x, y, l) {
+  n <- length(x)
+  if (abs(l) >= n) return(NA_real_)
+
+  if (l > 0) {
+    x2 <- x[1:(n - l)]
+    y2 <- y[(l + 1):n]
+  } else if (l < 0) {
+    l <- abs(l)
+    x2 <- x[(l + 1):n]
+    y2 <- y[1:(n - l)]
+  } else {
+    x2 <- x
+    y2 <- y
+  }
+
+  m <- min(length(x2), length(y2))
+  if (m < 3) return(NA_real_)
+  cor(x2[1:m], y2[1:m], use = "pairwise.complete.obs")
+}
+
+# Circular-shift permutation test
+assoc_test <- function(x, y, L = 8, B = 2000, seed = 123) {
+  set.seed(seed)
+  lags <- -L:L
+
+  obs <- sapply(lags, \(l) lag_corr(x, y, l))
+  S_obs <- max(abs(obs), na.rm = TRUE)
+
+  S_perm <- replicate(B, {
+    k <- sample(length(x), 1) - 1
+    x_perm <- c(x[(k + 1):length(x)], x[1:k])
+    max(abs(sapply(lags, \(l) lag_corr(x_perm, y, l))), na.rm = TRUE)
+  })
+
+  tibble(
+    lag = lags,
+    rho = obs,
+    p_value = mean(S_perm >= S_obs, na.rm = TRUE)
+  )
+}
+
+sent_vec_all <- rowMeans(
+  cbind(sent_vec_delfi, sent_vec_lrt, sent_vec_lrytas),
+  na.rm = TRUE
+)
+
+sent_all_list <- list(
+  Delfi    = sent_vec_delfi,
+  LRT      = sent_vec_lrt,
+  Lrytas   = sent_vec_lrytas,
+  Combined = sent_vec_all
+)
+
+perm_all <- map_dfr(names(sent_all_list), function(out) {
+  assoc_test(sent_all_list[[out]], inc_nat) |>
+    mutate(outlet = out)
+})
+
+titles_df <- perm_all |>
+  group_by(outlet) |>
+  summarise(p_title = first(p_value), .groups = "drop") |>
+  mutate(facet_title = paste0(outlet, " (p = ", signif(p_title, 3), ")"))
+
+perm_all2 <- perm_all |>
+  left_join(titles_df, by = "outlet")
+
+best_df <- perm_all2 |>
+  group_by(outlet) |>
+  summarise(
+    best_lag = lag[which.max(abs(rho))],
+    best_rho = rho[which.max(abs(rho))],
+    p_value = first(p_title),
+    facet_title = first(facet_title),
+    .groups = "drop"
+  )
+
+outlet_colors <- c(
+  "Delfi"    = "#E64B35FF",
+  "LRT"      = "#4DBBD5FF",
+  "Lrytas"   = "#00A087FF",
+  "Combined" = "#3C5488FF"
+)
+
+ggplot(perm_all2, aes(x = lag, y = rho, color = outlet)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.2) +
+  geom_vline(
+    data = best_df,
+    aes(xintercept = best_lag),
+    linetype = "dotted",
+    color = "black"
+  ) +
+  geom_text(
+    data = best_df,
+    aes(
+      x = best_lag,
+      y = best_rho,
+      label = paste0(
+        "lag = ", best_lag,
+        "\nρ = ", signif(best_rho, 3),
+        "\np = ", signif(p_value, 3)
+      )
+    ),
+    color = "black",
+    hjust = -0.1,
+    vjust = -0.5,
+    size = 3.5
+  ) +
+  facet_wrap(~ facet_title, ncol = 2, scales = "free_y") +
+  scale_y_continuous(expand = expansion(mult = c(0.25, 0.25))) +
+  scale_color_manual(values = outlet_colors) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Lagged Correlation Profiles: Media Sentiment vs COVID-19 Cases",
+    x = "Lag (weeks); positive = sentiment leads cases",
+    y = expression(rho(l)),
+    color = "Outlet"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    strip.text = element_text(face = "bold", size = 12),
+    legend.position = "none"
+  )
+
+run_lagged_rfcca <- function(Sx, Sy, label_x, label_y, lags = -8:8) {
+  tibble(
+    Lag = lags,
+    rho1 = sapply(lags, function(l) {
+      if (l > 0) {
+        x <- Sx[(l + 1):nrow(Sx), , drop = FALSE]
+        y <- Sy[1:(nrow(Sy) - l), , drop = FALSE]
+      } else if (l < 0) {
+        l <- abs(l)
+        x <- Sx[1:(nrow(Sx) - l), , drop = FALSE]
+        y <- Sy[(l + 1):nrow(Sy), , drop = FALSE]
+      } else {
+        x <- Sx; y <- Sy
+      }
+
+      tryCatch(
+        cancor(scale(x), scale(y))$cor[1],
+        error = function(e) NA_real_
+      )
+    }),
+    Pair = paste(label_x, label_y, sep = " vs ")
+  )
+}
+
+lag_grid <- -8:8
+lag_cases_vacc <- run_lagged_rfcca(S_cases, S_vacc, "Cases", "Vaccinations", lag_grid)
+lag_cases_temp <- run_lagged_rfcca(S_cases, S_temp, "Cases", "Temperature", lag_grid)
+lag_cases_ah   <- run_lagged_rfcca(S_cases, S_ah,   "Cases", "Absolute Humidity", lag_grid)
+
+lag_df <- bind_rows(
+  lag_cases_vacc,
+  lag_cases_temp,
+  lag_cases_ah
+)
+
+ggplot(lag_df, aes(x = Lag, y = rho1, color = Pair)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Lagged Reduced FCCA Profiles",
+    subtitle = "Positive lags indicate predictor leads COVID-19 cases",
+    x = "Lag (weeks)",
+    y = expression(rho[1])
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  theme(legend.title = element_blank())
+
+df_cv <- df_uv %>%
+  mutate(municipality_index = row_number()) %>%
+  pivot_longer(
+    cols = c(U1, V1),
+    names_to = "Variate",
+    values_to = "value"
+  )
+
+ggplot(df_cv, aes(x = municipality_index, y = value, color = Variate)) +
+  geom_line(linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  theme_minimal(base_size = 13) +
+  scale_color_manual(
+    values = c(
+      "U1" = "#1B9E77",
+      "V1" = "#D95F02"
+    ),
+    labels = c(
+      "U1" = "Cases Canonical Variate (U[1])",
+      "V1" = "Vaccination Canonical Variate (V[1])"
+    )
+  ) +
+  labs(
+    title = "Canonical Variates Across Municipalities",
+    x = "Municipality index",
+    y = "Canonical variate value",
+    color = ""
+  ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+#  --- 15. FOFR ---
+
+```{r function-on-function}
+Y_mat   <- t(eval.fd(t_grid, cases_fd))
+temp_mat <- t(eval.fd(t_grid, temp_fd))
+ah_mat   <- t(eval.fd(t_grid, ah_fd))
+vacc_mat <- t(eval.fd(t_grid, vacc_fd))
+
+# Sentiment is national-only so replicating same curve for each municipality
+sent_nat <- as.numeric(eval.fd(t_grid, sent_fd_avg))
+sent_mat <- matrix(
+  sent_nat,
+  nrow = nrow(Y_mat),
+  ncol = length(sent_nat),
+  byrow = TRUE
+)
+
+dat_pffr <- list(
+  Y    = Y_mat,
+  temp = temp_mat,
+  ah   = ah_mat,
+  vacc = vacc_mat,
+  sent = sent_mat,
+  id   = 1:nrow(Y_mat)
+)
+
+t_ind <- as.numeric(t_grid)
+
+mod_fofr <- pffr(
+  Y ~ ff(temp, xind = t_ind) +
+      ff(ah,   xind = t_ind) +
+      ff(vacc, xind = t_ind) +
+      ff(sent, xind = t_ind),
+  yind = t_ind,
+  data = dat_pffr
+)
+
+surf_df <- mod_fofr$coef.surface
+
+summary(mod_fofr)
+
+make_matrix <- function(df, term_name) {
+  df_term <- df[df$term == term_name, ]
+  s_vals <- sort(unique(df_term$s))
+  t_vals <- sort(unique(df_term$t))
+  zmat <- matrix(
+    df_term$beta,
+    nrow = length(s_vals),
+    ncol = length(t_vals),
+    byrow = FALSE
+  )
+  list(z = zmat, s = s_vals, t = t_vals)
+}
+
+pffr_plots <- plot(mod_fofr, scheme = 1, pages = 1, scale = 0, ask = FALSE)
+names(pffr_plots)
+
+surf_temp <- pffr_plots[[2]]
+surf_ah   <- pffr_plots[[3]]
+surf_vacc <- pffr_plots[[4]]
+surf_sent <- pffr_plots[[5]]
+
+extract_surface_df <- function(obj, name) {
+  xs <- obj$x
+  ys <- obj$y
+  mat <- matrix(obj$fit, nrow = length(xs), ncol = length(ys), byrow = FALSE)
+  
+  expand.grid(
+    s = xs,
+    t = ys
+  ) %>%
+    dplyr::mutate(
+      beta = as.vector(mat),
+      term = name
+    )
+}
+
+surf_df <- dplyr::bind_rows(
+  extract_surface_df(surf_temp, "Temperature"),
+  extract_surface_df(surf_ah,   "Absolute Humidity"),
+  extract_surface_df(surf_vacc, "Vaccination"),
+  extract_surface_df(surf_sent, "Sentiment")
+)
+
+make_matrix <- function(df, term_name) {
+  df_term <- df[df$term == term_name, ]
+  
+  s_vals <- sort(unique(df_term$s))
+  t_vals <- sort(unique(df_term$t))
+  
+  zmat <- matrix(df_term$beta,
+                 nrow = length(s_vals),
+                 ncol = length(t_vals),
+                 byrow = FALSE)
+  
+  list(z = zmat, s = s_vals, t = t_vals)
+}
+
+pal <- colorRampPalette(c("#2166AC", "white", "#B2182B"))
+
+plot_surface_image <- function(df, term_name) {
+  mat <- make_matrix(df, term_name)
+  
+  image(mat$s, mat$t, mat$z,
+        col = pal(50),
+        xlab = "Predictor time (s)",
+        ylab = "Response time (t)",
+        main = paste("β(s,t):", term_name))
+  
+  contour(mat$s, mat$t, mat$z,
+          nlevels = 10,
+          add = TRUE,
+          drawlabels = FALSE,
+          col = "grey40")
+}
+
+par(mfrow = c(2, 2), oma = c(1,1,2,1))
+
+plot_surface_image(surf_df, "Temperature")
+plot_surface_image(surf_df, "Absolute Humidity")
+plot_surface_image(surf_df, "Vaccination")
+plot_surface_image(surf_df, "Sentiment")
+
+mtext("Coefficient Surfaces β(s,t) from Function-on-Function Regression",
+      outer = TRUE, cex = 1.4, font = 2)
+
+compute_functional_R2 <- function(model, Y_obs) {
+  Y_hat <- fitted(model)
+  SS_tot <- sum((Y_obs - mean(Y_obs))^2)
+  SS_res <- sum((Y_obs - Y_hat)^2)
+  1 - SS_res / SS_tot
+}
+
+mod_weather <- pffr(
+  Y ~ ff(temp, xind = t_ind) +
+      ff(ah,   xind = t_ind),
+  yind = t_ind,
+  data = dat_pffr
+)
+
+Y_obs <- Y_mat
+R2_weather <- compute_functional_R2(mod_weather, Y_obs)
+
+mod_weather_vacc <- pffr(
+  Y ~ ff(temp, xind = t_ind) +
+      ff(ah,   xind = t_ind) +
+      ff(vacc, xind = t_ind),
+  yind = t_ind,
+  data = dat_pffr
+)
+
+R2_weather_vacc <- compute_functional_R2(mod_weather_vacc, Y_obs)
+
+mod_weather_vacc_sent <- pffr(
+  Y ~ ff(temp, xind = t_ind) +
+      ff(ah,   xind = t_ind) +
+      ff(vacc, xind = t_ind) +
+      ff(sent, xind = t_ind),
+  yind = t_ind,
+  data = dat_pffr
+)
+
+R2_weather_vacc_sent <- compute_functional_R2(
+  mod_weather_vacc_sent,
+  Y_obs
+)
+
+R2_table <- tibble(
+  Model = c(
+    "Weather only",
+    "Weather + vaccination",
+    "Weather + vaccination + sentiment"
+  ),
+  Functional_R2 = round(
+    c(R2_weather, R2_weather_vacc, R2_weather_vacc_sent),
+    3
+  )
+)
+
+print(R2_table)
+```
