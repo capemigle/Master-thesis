@@ -46,6 +46,8 @@ to_mat <- function(df, value_col, id_col = "municipality_name") {
 #  --- 3. Data upload ---
 
 ```{r file_import}
+# Raw data files are not included in this repository due to data access
+# and licensing restrictions. Paths are shown for documentation only.
 path_master    <- "data/master_weekly_fda_ready.csv"
 path_sentiment <- "data/media_weekly_sentiment.csv"
 
@@ -875,3 +877,4 @@ R2_table <- tibble(
 
 print(R2_table)
 ```
+
